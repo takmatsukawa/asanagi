@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>あさなぎ浜</title>
+<style>
+html,body{margin:0;height:100%;background:#0d1020;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;font-family:-apple-system,"Hiragino Sans",sans-serif}
+canvas{display:block;width:100%;height:100%}
+#start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0d1020}
+#start button{width:120px;height:120px;border-radius:50%;border:2px solid #ffe2a0;background:radial-gradient(circle,#3a3350,#14162a);box-shadow:0 0 40px rgba(255,200,120,.25);cursor:pointer}
+#start button::after{content:"";display:block;margin:0 auto;width:44px;height:22px;border-radius:44px 44px 0 0;background:#ffe2a0}
+#dbg{position:fixed;left:8px;top:calc(8px + env(safe-area-inset-top));font:11px/1.4 ui-monospace,monospace;color:#cfe;background:rgba(0,0,0,.55);padding:6px 8px;border-radius:6px;white-space:pre;display:none;pointer-events:none}
+#pc{position:fixed;right:8px;top:calc(8px + env(safe-area-inset-top));display:none;gap:6px;flex-direction:column;align-items:flex-end}
+#pc input{width:140px}
+#pc button{font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="start"><button id="go" aria-label="はじめる"></button></div>
+<div id="dbg"></div>
+<div id="pc"><input id="lightSlider" type="range" min="0" max="100" value="5" aria-label="光"><button id="stepBtn">一歩（Space）</button></div>
+<script>
+// ===== tuning =====
+const T = {
+  tideMinutes: 15,          // 起床から満潮まで
+  stepsToDrain: 60,         // 潮が引き切るまでの歩数
+  refillPerSec: 0.012,      // 歩かないと潮が戻る速さ（0..1/秒）
+  refillDelay: 12,          // 何秒止まると戻り始めるか
+  stepsPerMeter: 1.4,
+  glints: [18, 42, 70],     // 輝きの位置（歩数）
+  lightOn: 0.55,            // 輝きが見える明るさ
+  stepThresh: 11.8, stepGapMs: 280,
+};
+const qs = new URLSearchParams(location.search);
+if (qs.has('fast')) T.tideMinutes = 2;
+const DEBUG = qs.has('debug');
+
+// ===== state =====
+const S = {
+  started:false, t0:0, light:0.05, rawLight:0, tide:1, steps:0, lastStep:-1e9,
+  found:[], over:false, pulse:0, flashes:[],
+};
+
+// ===== sensors =====
+let video, vctx, camOK=false, motionOK=false, lumMin=1, lumMax=0;
+async function startCamera(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:160,height:120},audio:false});
+    video = document.createElement('video'); video.playsInline = true; video.muted = true; video.srcObject = stream; await video.play();
+    const track = stream.getVideoTracks()[0];
+    // 露出を固定できる端末では固定する（自動露出だと明るさが打ち消される）
+    try{ const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.exposureMode && caps.exposureMode.includes('manual')) await track.applyConstraints({advanced:[{exposureMode:'manual'}]});
+      S.expInfo = caps.exposureMode ? caps.exposureMode.join('/') : 'auto only';
+    }catch(e){ S.expInfo='lock failed'; }
+    const cv = document.createElement('canvas'); cv.width=32; cv.height=24; vctx = cv.getContext('2d',{willReadFrequently:true});
+    camOK = true;
+  }catch(e){ S.camErr = e.name; }
+}
+function readLight(){
+  if(!camOK || video.readyState<2) return null;
+  vctx.drawImage(video,0,0,32,24);
+  const d = vctx.getImageData(0,0,32,24).data; let sum=0, hot=0;
+  for(let i=0;i<d.length;i+=4){ const y=(0.299*d[i]+0.587*d[i+1]+0.114*d[i+2])/255; sum+=y; if(y>0.92) hot++; }
+  const mean = sum/(d.length/4), hotFrac = hot/(d.length/4);
+  // 自動露出があっても、窓の光は白飛びとして残る。平均と白飛び率を混ぜる
+  return Math.min(1, mean*0.6 + hotFrac*1.4);
+}
+let lastMag=9.8, rising=false;
+function onMotion(e){
+  const a = e.accelerationIncludingGravity; if(!a || a.x==null) return;
+  motionOK = true;
+  const mag = Math.hypot(a.x,a.y,a.z);
+  S.mag = mag; S.upright = Math.abs(a.y) > 6; // 縦持ち＝体を起こしている目安
+  const now = performance.now();
+  if(mag > T.stepThresh && lastMag <= T.stepThresh && now - S.lastStep > T.stepGapMs) step();
+  lastMag = mag;
+}
+async function startMotion(){
+  try{
+    if (typeof DeviceMotionEvent!=='undefined' && DeviceMotionEvent.requestPermission){
+      const r = await DeviceMotionEvent.requestPermission(); if(r!=='granted'){ S.motErr='denied'; return; }
+    }
+    window.addEventListener('devicemotion', onMotion);
+  }catch(e){ S.motErr = e.name; }
+}
+
+// ===== audio =====
+let ac, waveGain, waveFilter;
+function startAudio(){
+  ac = new (window.AudioContext||window.webkitAudioContext)();
+  const len = ac.sampleRate*4, buf = ac.createBuffer(1,len,ac.sampleRate), ch = buf.getChannelData(0);
+  let b=0; for(let i=0;i<len;i++){ b = 0.98*b + 0.02*(Math.random()*2-1); ch[i]=b*6; }
+  const src = ac.createBufferSource(); src.buffer=buf; src.loop=true;
+  waveFilter = ac.createBiquadFilter(); waveFilter.type='lowpass'; waveFilter.frequency.value=500;
+  waveGain = ac.createGain(); waveGain.gain.value=0.0;
+  src.connect(waveFilter).connect(waveGain).connect(ac.destination); src.start();
+}
+function chime(f=880, dur=1.2, vol=0.18){
+  if(!ac) return; const t=ac.currentTime;
+  [1,2.01,3.02].forEach((m,i)=>{ const o=ac.createOscillator(), g=ac.createGain(); o.type='sine'; o.frequency.value=f*m;
+    g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol/(i+1),t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g).connect(ac.destination); o.start(t); o.stop(t+dur); });
+}
+function stepSound(){
+  if(!ac) return; const t=ac.currentTime, n=ac.createBufferSource(), len=ac.sampleRate*0.08, b=ac.createBuffer(1,len,ac.sampleRate), c=b.getChannelData(0);
+  for(let i=0;i<len;i++) c[i]=(Math.random()*2-1)*(1-i/len);
+  const f=ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1800; const g=ac.createGain(); g.gain.value=0.08;
+  n.buffer=b; n.connect(f).connect(g).connect(ac.destination); n.start(t);
+}
+
+// ===== game =====
+function step(){
+  if(S.over) return;
+  S.lastStep = performance.now(); S.steps++;
+  S.tide = Math.max(0, S.tide - 1/T.stepsToDrain);
+  stepSound();
+}
+function glintState(pos){
+  // 0: まだ遠い/潮の下, 1: 見えている, 2: 足元（拾える）
+  const revealed = S.tide < 0.85 - (pos/120)*0.6; // 遠いものほど潮が引かないと出ない
+  if(!revealed || S.light < T.lightOn) return 0;
+  return S.steps >= pos ? 2 : 1;
+}
+function tryPick(x,y){
+  T.glints.forEach((pos,i)=>{
+    if(S.found.includes(i)) return;
+    if(glintState(pos)===2){ const g = glintScreen(pos); if(Math.hypot(g.x-x,g.y-y) < 70){ S.found.push(i); chime(660+i*220); S.flashes.push({x:g.x,y:g.y,t:0}); } }
+  });
+}
+
+// ===== render =====
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+let W,H,DPR;
+function resize(){ DPR=Math.min(2,devicePixelRatio||1); W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; g.setTransform(DPR,0,0,DPR,0,0); }
+addEventListener('resize',resize); resize();
+const horizon=()=>H*0.42, shoreY=()=>H*(0.58 + (1-S.tide)*0.16); // 潮が引くほど水際が上がる…ではなく下がって見えるよう砂が広がる
+function seaBottom(){ return H*0.62 - (1-S.tide)*H*0.06; }
+function wetBottom(){ return seaBottom() + 10 + (1-S.tide)*H*0.16; }
+function glintScreen(pos){
+  const rel = pos - S.steps; // 0で足元
+  const x = W*0.5 + rel*W*0.035; const top=seaBottom()+8, bot=wetBottom()-6;
+  const y = top + (bot-top)*(0.35 + 0.5*((pos*7)%10)/10);
+  return {x,y};
+}
+function draw(dt){
+  const L = S.light, hz = horizon();
+  // sky
+  let sky=g.createLinearGradient(0,0,0,hz);
+  sky.addColorStop(0,`hsl(228,35%,${6+L*32}%)`); sky.addColorStop(1,`hsl(${230-L*205},${30+L*50}%,${10+L*55}%)`);
+  g.fillStyle=sky; g.fillRect(0,0,W,hz);
+  const sunY = hz + 30 - L*90;
+  let sg=g.createRadialGradient(W*0.72,hz,0,W*0.72,hz,W); sg.addColorStop(0,`rgba(255,215,150,${0.85*L})`); sg.addColorStop(1,'rgba(255,200,120,0)');
+  g.fillStyle=sg; g.fillRect(0,0,W,hz);
+  g.save(); g.beginPath(); g.rect(0,0,W,hz); g.clip();
+  g.fillStyle=`rgba(255,236,190,${Math.min(1,L*1.3)})`; g.beginPath(); g.arc(W*0.72,sunY,28,0,7); g.fill(); g.restore();
+  // stars fade
+  if(L<0.4){ g.fillStyle=`rgba(255,255,255,${(0.4-L)*1.5})`; for(let i=0;i<40;i++){ g.fillRect((i*97)%W,(i*53)%(hz*0.7),1.2,1.2);} }
+  // sea
+  const sb = seaBottom();
+  let sea=g.createLinearGradient(0,hz,0,sb); sea.addColorStop(0,`hsl(212,40%,${10+L*28}%)`); sea.addColorStop(1,`hsl(200,35%,${7+L*20}%)`);
+  g.fillStyle=sea; g.fillRect(0,hz,W,sb-hz);
+  const tt = performance.now()/1000;
+  for(let i=0;i<60;i++){ const y = hz+4+((i*37.7)%1)*(sb-hz-6) + (i/60)*(sb-hz-6)*0; const yy = hz + 3 + (i/60)*(sb-hz-6);
+    const w = (6+((i*13)%20))*(1-(yy-hz)/(sb-hz+1)*0.5); const x = W*0.72 + Math.sin(tt*1.3+i)*14*(yy-hz)/(sb-hz+1)*2 - w/2;
+    g.fillStyle=`rgba(255,225,170,${L*(0.25+((i*7)%10)/14)})`; g.fillRect(x,yy,w,1.5); }
+  // wet sand + wave edge
+  const wb = wetBottom(), wave = Math.sin(tt*0.8)*4;
+  let wet=g.createLinearGradient(0,sb,0,wb); wet.addColorStop(0,`hsl(28,20%,${12+L*28}%)`); wet.addColorStop(1,`hsl(32,24%,${16+L*30}%)`);
+  g.fillStyle=wet; g.fillRect(0,sb,W,wb-sb);
+  g.fillStyle=sea; g.beginPath(); g.moveTo(0,sb-2); for(let x=0;x<=W;x+=8) g.lineTo(x, sb + wave + Math.sin(x/38+tt)*3); g.lineTo(W,sb-2); g.fill();
+  g.strokeStyle=`rgba(255,250,240,${0.3+L*0.5})`; g.lineWidth=2; g.beginPath(); for(let x=0;x<=W;x+=8) g.lineTo(x, sb + wave + Math.sin(x/38+tt)*3 + 1); g.stroke();
+  // dry sand
+  let dry=g.createLinearGradient(0,wb,0,H); dry.addColorStop(0,`hsl(36,30%,${22+L*40}%)`); dry.addColorStop(1,`hsl(33,25%,${16+L*30}%)`);
+  g.fillStyle=dry; g.fillRect(0,wb,W,H-wb);
+  // footprints (scroll with steps)
+  for(let k=0;k<14;k++){ const s = S.steps - k; if(s<0) break; const rel = -k; const x = W*0.5 + rel*W*0.035 + (s%2?6:-6); const y = wb + 30 + Math.sin(s*0.3)*4;
+    g.fillStyle=`rgba(50,35,20,${0.35*(1-k/14)})`; g.beginPath(); g.ellipse(x,y,4,7,1.3,0,7); g.fill(); }
+  // glints
+  S.pulse += dt;
+  T.glints.forEach((pos,i)=>{
+    if(S.found.includes(i)) return;
+    const st = glintState(pos); if(!st) return;
+    const {x,y} = glintScreen(pos); if(x<-40||x>W+40) return;
+    const s = st===2 ? 1.25 + Math.sin(S.pulse*5)*0.2 : 0.7 + Math.sin(S.pulse*2+i)*0.15;
+    const a = Math.min(1,(L-T.lightOn)/0.2+0.3);
+    let gl=g.createRadialGradient(x,y,0,x,y,30*s); gl.addColorStop(0,`rgba(255,255,240,${a})`); gl.addColorStop(0.25,`rgba(170,240,225,${0.6*a})`); gl.addColorStop(1,'rgba(170,240,225,0)');
+    g.fillStyle=gl; g.fillRect(x-40,y-40,80,80);
+    g.strokeStyle=`rgba(255,255,255,${0.9*a})`; g.lineWidth=1.3; g.beginPath(); g.moveTo(x-15*s,y); g.lineTo(x+15*s,y); g.moveTo(x,y-15*s); g.lineTo(x,y+15*s); g.stroke();
+  });
+  // pick flashes
+  S.flashes = S.flashes.filter(f=>{ f.t+=dt; const r=f.t*160; g.strokeStyle=`rgba(255,240,200,${1-f.t})`; g.lineWidth=2; g.beginPath(); g.arc(f.x,f.y,r,0,7); g.stroke(); return f.t<1; });
+  // darkness of unlit room: overall veil
+  g.fillStyle=`rgba(8,10,25,${Math.max(0,0.55-L*0.6)})`; g.fillRect(0,0,W,H);
+  // HUD: light arc (top), tide clock (bottom-left), slots (bottom-right)
+  const top = 50 + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sat'))||0);
+  g.lineWidth=3; g.strokeStyle='rgba(255,255,255,.22)'; g.beginPath(); g.arc(W/2,top+40,44,Math.PI,0); g.stroke();
+  const ang = Math.PI + Math.PI*L; g.strokeStyle='#ffe2a0'; g.beginPath(); g.arc(W/2,top+40,44,Math.PI,ang); g.stroke();
+  g.fillStyle='#ffe2a0'; g.beginPath(); g.arc(W/2+44*Math.cos(ang),top+40+44*Math.sin(ang),6,0,7); g.fill();
+  // tick mark where glints appear
+  const ta = Math.PI + Math.PI*T.lightOn; g.strokeStyle='rgba(255,255,255,.5)'; g.lineWidth=1.5; g.beginPath(); g.moveTo(W/2+38*Math.cos(ta),top+40+38*Math.sin(ta)); g.lineTo(W/2+50*Math.cos(ta),top+40+50*Math.sin(ta)); g.stroke();
+  const by = H - 56;
+  const remain = Math.max(0, 1 - (S.started ? (performance.now()-S.t0)/(T.tideMinutes*60000) : 0));
+  g.fillStyle='rgba(255,255,255,.16)'; g.beginPath(); g.arc(40,by,18,0,7); g.fill();
+  g.fillStyle='rgba(150,210,230,.95)'; g.beginPath(); g.moveTo(40,by); g.arc(40,by,18,-Math.PI/2,-Math.PI/2+Math.PI*2*remain); g.fill();
+  T.glints.forEach((_,i)=>{ const x=W-40-(T.glints.length-1-i)*34; g.strokeStyle='rgba(255,255,255,.5)'; g.lineWidth=1.5; g.beginPath(); g.arc(x,by,12,0,7); g.stroke();
+    if(S.found.includes(i)){ g.fillStyle=['#8cdcc8','#e6c8a0','#b8c8f0'][i%3]; g.beginPath(); g.moveTo(x,by-10); g.lineTo(x+9,by+2); g.lineTo(x-2,by+10); g.lineTo(x-10,by); g.fill(); } });
+  // high tide end
+  if(S.over){ g.fillStyle='rgba(10,16,30,.6)'; g.fillRect(0,0,W,H);
+    T.glints.forEach((_,i)=>{ const x=W/2+(i-1)*70, y=H/2; g.strokeStyle='rgba(255,255,255,.35)'; g.beginPath(); g.arc(x,y,24,0,7); g.stroke();
+      if(S.found.includes(i)){ g.fillStyle=['#8cdcc8','#e6c8a0','#b8c8f0'][i%3]; g.beginPath(); g.ellipse(x,y,18,14,0.4,0,7); g.fill(); } }); }
+}
+
+// ===== loop =====
+let last=performance.now();
+function frame(now){
+  const dt = Math.min(0.1,(now-last)/1000); last=now;
+  if(S.started && !S.over){
+    const r = readLight(); if(r!=null){ S.rawLight=r; lumMin=Math.min(lumMin,r); lumMax=Math.max(lumMax,r); }
+    const target = camOK ? S.rawLight : +document.getElementById('lightSlider').value/100;
+    S.light += (target - S.light) * Math.min(1, dt*1.5);
+    if((now - S.lastStep)/1000 > T.refillDelay) S.tide = Math.min(1, S.tide + T.refillPerSec*dt);
+    if(now - S.t0 > T.tideMinutes*60000){ S.over = true; chime(440,2.5,0.12); }
+    if(waveGain){ waveGain.gain.value = 0.25 + S.light*0.35; waveFilter.frequency.value = 400 + S.light*900; }
+  }
+  draw(dt);
+  if(DEBUG || !camOK || !motionOK){
+    const d=document.getElementById('dbg'); d.style.display='block';
+    d.textContent = `light ${S.light.toFixed(2)} raw ${S.rawLight.toFixed(2)} (min ${lumMin.toFixed(2)} max ${lumMax.toFixed(2)})\n`+
+      `cam ${camOK?'ok':'no'} ${S.camErr||''} exp ${S.expInfo||'-'}\n`+
+      `motion ${motionOK?'ok':'no'} ${S.motErr||''} mag ${(S.mag||0).toFixed(1)} upright ${S.upright?'y':'n'}\n`+
+      `steps ${S.steps} tide ${S.tide.toFixed(2)}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ===== input =====
+document.getElementById('go').addEventListener('click', async ()=>{
+  startAudio(); await startMotion(); await startCamera();
+  document.getElementById('start').style.display='none';
+  S.started=true; S.t0=performance.now(); S.lastStep=performance.now();
+  if(!camOK || !('ontouchstart' in window)) document.getElementById('pc').style.display='flex';
+  chime(523,1.5,0.1);
+});
+cv.addEventListener('pointerdown', e=>tryPick(e.clientX,e.clientY));
+document.getElementById('stepBtn').addEventListener('click', step);
+addEventListener('keydown', e=>{ if(e.code==='Space'){ e.preventDefault(); step(); } });
+</script>
+</body>
+</html>
